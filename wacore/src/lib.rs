@@ -8,6 +8,7 @@ pub mod libsignal;
 pub mod messages;
 pub mod pair;
 pub mod phone_pair;
+pub use phone_pair::PairClientType;
 pub mod prekeys;
 pub mod proto_helpers;
 pub mod request;

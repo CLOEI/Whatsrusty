@@ -1,4 +1,4 @@
-pub use wacore::{proto_helpers, store::traits};
+pub use wacore::{proto_helpers, store::traits, PairClientType};
 
 pub mod types;
 
