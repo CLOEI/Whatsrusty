@@ -10,6 +10,14 @@ pub struct VerifiedName {
     pub details: Box<wa::verified_name_certificate::Details>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IsOnWhatsAppResponse {
+    pub query: String,
+    pub jid: Jid,
+    pub is_in: bool,
+    pub verified_name: Option<VerifiedName>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LocalChatSettings {
     pub found: bool,

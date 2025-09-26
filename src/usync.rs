@@ -1,9 +1,10 @@
 use crate::client::Client;
-use log::debug;
+use log::{debug, warn};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use wacore_binary::jid::{Jid, SERVER_JID};
 use wacore_binary::node::NodeContent;
+use wacore::types::user::IsOnWhatsAppResponse;
 
 impl Client {
     pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
@@ -67,5 +68,38 @@ impl Client {
         }
 
         Ok(all_devices)
+    }
+
+    /// Checks if the given phone numbers are registered on WhatsApp.
+    ///
+    /// The phone numbers should be in international format, including the `+` prefix.
+    pub async fn is_on_whatsapp(&self, phone_numbers: &[String]) -> Result<Vec<IsOnWhatsAppResponse>, anyhow::Error> {
+        debug!("is_on_whatsapp: Checking {} phone numbers", phone_numbers.len());
+
+        let sid = self.generate_request_id();
+        let usync_node = wacore::usync::build_is_on_whatsapp_query(phone_numbers, &sid);
+
+        let iq = crate::request::InfoQuery {
+            namespace: "usync",
+            query_type: crate::request::InfoQueryType::Get,
+            to: SERVER_JID.parse().unwrap(),
+            content: Some(NodeContent::Nodes(vec![usync_node])),
+            id: None,
+            target: None,
+            timeout: None,
+        };
+
+        let resp_node = self.send_iq(iq).await?;
+
+        match wacore::usync::parse_is_on_whatsapp_response(&resp_node) {
+            Ok(responses) => {
+                debug!("is_on_whatsapp: Successfully parsed {} responses", responses.len());
+                Ok(responses)
+            },
+            Err(err) => {
+                warn!("Failed to parse IsOnWhatsApp response: {}", err);
+                Err(err)
+            }
+        }
     }
 }

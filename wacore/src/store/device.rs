@@ -77,7 +77,7 @@ fn build_base_client_payload(
 }
 
 static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(|| wa::DeviceProps {
-    os: Some("rust".to_string()),
+    os: Some("Chattea".to_string()),
     version: Some(wa::device_props::AppVersion {
         primary: Some(0),
         secondary: Some(1),
