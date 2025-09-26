@@ -141,6 +141,7 @@ pub struct Client {
     pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
     pub(crate) major_sync_task_sender: mpsc::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<watch::Sender<()>>>>,
+    pub(crate) phone_linking_cache: Arc<Mutex<Option<wacore::phone_pair::PhoneLinkingCache>>>,
 
     pub(crate) send_buffer_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 
@@ -241,6 +242,7 @@ impl Client {
             initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
+            phone_linking_cache: Arc::new(Mutex::new(None)),
             send_buffer_pool: Arc::new(Mutex::new(Vec::with_capacity(4))),
             custom_enc_handlers: Arc::new(DashMap::new()),
             stanza_router: Self::create_stanza_router(),
@@ -1345,5 +1347,141 @@ impl Client {
                 );
             }
         }
+    }
+
+    /// Generates a pairing code that can be used to link to a phone without scanning a QR code.
+    ///
+    /// This method implements WhatsApp's phone number pairing functionality, allowing users to
+    /// link their account to a new device by entering an 8-digit pairing code on their phone.
+    ///
+    /// # Arguments
+    ///
+    /// * `phone` - The phone number to link to (will be normalized to international format)
+    /// * `show_push_notification` - Whether to show a push notification on the phone
+    /// * `client_type` - The type of client being paired (Chrome, Firefox, etc.)
+    /// * `client_display_name` - Display name for the client
+    ///
+    /// # Returns
+    ///
+    /// Returns an 8-character pairing code (with dash separator) that the user should enter
+    /// on their phone to complete the pairing process.
+    ///
+    /// # Errors
+    ///
+    /// This method can fail for several reasons:
+    /// - Phone number is too short (≤6 digits)
+    /// - Phone number starts with 0 (not international format)
+    /// - Network or server errors during the pairing request
+    /// - Cryptographic operations fail
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use wacore::phone_pair::PairClientType;
+    ///
+    /// # async fn example(client: &whatsapp_rust::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let pairing_code = client.pair_phone(
+    ///     "+1234567890".to_string(),
+    ///     true, // show push notification
+    ///     PairClientType::Chrome,
+    ///     "My Computer".to_string()
+    /// ).await?;
+    ///
+    /// println!("Enter this code on your phone: {}", pairing_code);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn pair_phone(
+        &self,
+        phone: String,
+        show_push_notification: bool,
+        client_type: wacore::phone_pair::PairClientType,
+        client_display_name: String,
+    ) -> Result<String, anyhow::Error> {
+        // Validate and normalize phone number
+        let normalized_phone = wacore::phone_pair::validate_and_normalize_phone(&phone)?;
+
+        // Generate ephemeral keys and linking code
+        let (ephemeral_key_pair, ephemeral_key, encoded_linking_code) =
+            wacore::phone_pair::generate_companion_ephemeral_key()?;
+
+        let jid = Jid::new(&normalized_phone, wacore_binary::jid::DEFAULT_USER_SERVER);
+
+        // Get device's noise key for the request
+        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let noise_key_pub = device_snapshot.noise_key.public_key.public_key_bytes();
+
+        // Build and send the link_code_companion_reg IQ
+        let link_code_node = NodeBuilder::new("link_code_companion_reg")
+            .attrs([
+                ("jid", jid.to_string()),
+                ("stage", "companion_hello".to_string()),
+                ("should_show_push_notification", show_push_notification.to_string()),
+            ])
+            .children([
+                NodeBuilder::new("link_code_pairing_wrapped_companion_ephemeral_pub")
+                    .bytes(ephemeral_key.clone())
+                    .build(),
+                NodeBuilder::new("companion_server_auth_key_pub")
+                    .bytes(noise_key_pub.to_vec())
+                    .build(),
+                NodeBuilder::new("companion_platform_id")
+                    .bytes((client_type as i32).to_string())
+                    .build(),
+                NodeBuilder::new("companion_platform_display")
+                    .bytes(client_display_name)
+                    .build(),
+                NodeBuilder::new("link_code_pairing_nonce")
+                    .bytes(vec![0u8])
+                    .build(),
+            ])
+            .build();
+
+        let iq = crate::request::InfoQuery {
+            namespace: "md",
+            query_type: crate::request::InfoQueryType::Set,
+            to: wacore_binary::jid::SERVER_JID.parse()?,
+            target: None,
+            id: None,
+            content: Some(wacore_binary::node::NodeContent::Nodes(vec![link_code_node])),
+            timeout: None,
+        };
+
+        log::info!(target: "Client/PhonePair", "Sending link_code_companion_reg IQ for phone: {}", normalized_phone);
+        let response = self.send_iq(iq).await?;
+        log::info!(target: "Client/PhonePair", "Received response for link_code_companion_reg");
+
+        // Extract pairing reference from response
+        let pairing_ref_node = response
+            .get_optional_child_by_tag(&["link_code_companion_reg", "link_code_pairing_ref"])
+            .ok_or_else(|| anyhow::anyhow!("Missing link_code_pairing_ref in response"))?;
+
+        let pairing_ref = match &pairing_ref_node.content {
+            Some(wacore_binary::node::NodeContent::Bytes(bytes)) => {
+                String::from_utf8(bytes.clone())
+                    .map_err(|_| anyhow::anyhow!("Invalid pairing ref format"))?
+            }
+            _ => return Err(anyhow::anyhow!("Unexpected pairing ref content type")),
+        };
+
+        // Cache the linking state for later use in notification handler
+        let phone_linking_cache = wacore::phone_pair::PhoneLinkingCache {
+            jid,
+            key_pair: ephemeral_key_pair,
+            linking_code: encoded_linking_code.clone(),
+            pairing_ref,
+        };
+
+        *self.phone_linking_cache.lock().await = Some(phone_linking_cache);
+
+        // Format the linking code with dash separator (XXXX-XXXX format)
+        let formatted_code = format!(
+            "{}-{}",
+            &encoded_linking_code[0..4],
+            &encoded_linking_code[4..]
+        );
+
+        log::info!(target: "Client/PhonePair", "Generated pairing code: {} - waiting for user to enter it on phone {}", formatted_code, normalized_phone);
+        Ok(formatted_code)
     }
 }

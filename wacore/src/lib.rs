@@ -7,6 +7,7 @@ pub mod history_sync;
 pub mod libsignal;
 pub mod messages;
 pub mod pair;
+pub mod phone_pair;
 pub mod prekeys;
 pub mod proto_helpers;
 pub mod request;

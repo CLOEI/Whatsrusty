@@ -1,5 +1,6 @@
 use chrono::Local;
 use log::{error, info};
+use wacore::phone_pair::PairClientType;
 use std::io::Cursor;
 use std::sync::Arc;
 use wacore::download::{Downloadable, MediaType};
@@ -53,8 +54,18 @@ fn main() {
                                 "New pairing code received (valid for {} seconds):",
                                 timeout.as_secs()
                             );
-                            info!("\n{}\n", code);
+                            info!("Scan this QR code with WhatsApp:\n{}\n", code);
                             info!("----------------------------------------");
+
+                            info!("QR code received, but attempting phone pairing instead...");
+                            let res = client.pair_phone("628984017814".to_string(), true, PairClientType::Chrome, "Chrome (Linux)".to_string()).await;
+                            match res {
+                                Ok(pairing_code) => {
+                                    info!("🔢 Phone pairing code: {}", pairing_code);
+                                    info!("Enter this code on your WhatsApp mobile app: Linked Devices > Link a Device > Link with phone number instead");
+                                },
+                                Err(e) => error!("Failed to initiate phone pairing: {}", e),
+                            }
                         }
 
                         Event::Message(msg, info) => {
