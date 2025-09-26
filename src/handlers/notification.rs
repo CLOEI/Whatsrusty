@@ -101,90 +101,86 @@ async fn handle_notification_impl(client: &Arc<Client>, node: &Node) {
 ///
 /// This implements the cryptographic exchange that happens when a user enters the 8-digit
 /// pairing code on their phone to link the companion device.
-async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: &Node) {
+async fn handle_code_pair_notification(client: &Arc<Client>, parent_node: &Node) {
     use wacore::phone_pair::*;
     use wacore_binary::node::NodeContent;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::jid::SERVER_JID;
     use log::{error, info};
 
-    let link_node = match notification_node.get_optional_child("link_code_companion_reg") {
+    // Find the link_code_companion_reg node inside the notification
+    let node = match parent_node.get_optional_child("link_code_companion_reg") {
         Some(node) => node,
         None => {
-            error!(target: "Client/PhonePair", "Received code pair notification without link_code_companion_reg node");
+            error!(target: "Client/PhonePair", "Missing link_code_companion_reg element in notification");
             return;
         }
     };
 
-    if let Some(stage) = link_node.attrs.get("stage") {
-        if stage != "primary_hello" {
-            error!(target: "Client/PhonePair", "Received code pair notification with unexpected stage: {}", stage);
-            return;
-        }
-    } else {
-        error!(target: "Client/PhonePair", "Received code pair notification without stage attribute");
-        return;
-    }
-
+    // Get the phone linking cache - this must exist for pairing to work
     let link_cache = match client.phone_linking_cache.lock().await.take() {
         Some(cache) => cache,
         None => {
-            error!(target: "Client/PhonePair", "Received code pair notification without pending pairing");
+            error!(target: "Client/PhonePair", "Received code pair notification without a pending pairing");
             return;
         }
     };
 
-    let pairing_ref_bytes = match link_node.get_optional_child("link_code_pairing_ref")
+    // Extract pairing reference and validate it matches our cache
+    let link_code_pairing_ref = match node
+        .get_optional_child("link_code_pairing_ref")
         .and_then(|n| n.content.as_ref())
     {
         Some(NodeContent::Bytes(bytes)) => bytes,
         _ => {
-            error!(target: "Client/PhonePair", "Missing or invalid link_code_pairing_ref in notification");
+            error!(target: "Client/PhonePair", "Missing link_code_pairing_ref element");
             return;
         }
     };
 
-    let pairing_ref = match String::from_utf8(pairing_ref_bytes.clone()) {
-        Ok(ref_str) => ref_str,
+    let pairing_ref_str = match String::from_utf8(link_code_pairing_ref.clone()) {
+        Ok(s) => s,
         Err(_) => {
             error!(target: "Client/PhonePair", "Invalid UTF-8 in pairing reference");
             return;
         }
     };
 
-    if pairing_ref != link_cache.pairing_ref {
-        error!(target: "Client/PhonePair", "Pairing reference mismatch in code pair notification");
-        error!(target: "Client/PhonePair", "Expected: {}", link_cache.pairing_ref);
-        error!(target: "Client/PhonePair", "Received: {}", pairing_ref);
+    if pairing_ref_str != link_cache.pairing_ref {
+        error!(target: "Client/PhonePair", "Pairing ref mismatch in code pair notification");
         return;
     }
 
-    let wrapped_primary_ephemeral_pub = match link_node
+    // Extract wrapped primary ephemeral public key
+    let wrapped_primary_ephemeral_pub = match node
         .get_optional_child("link_code_pairing_wrapped_primary_ephemeral_pub")
         .and_then(|n| n.content.as_ref())
     {
         Some(NodeContent::Bytes(bytes)) => bytes,
         _ => {
-            error!(target: "Client/PhonePair", "Missing link_code_pairing_wrapped_primary_ephemeral_pub");
+            error!(target: "Client/PhonePair", "Missing link_code_pairing_wrapped_primary_ephemeral_pub element");
             return;
         }
     };
 
-    let primary_identity_pub = match link_node
+    // Extract primary identity public key
+    let primary_identity_pub = match node
         .get_optional_child("primary_identity_pub")
         .and_then(|n| n.content.as_ref())
     {
         Some(NodeContent::Bytes(bytes)) => bytes,
         _ => {
-            error!(target: "Client/PhonePair", "Missing primary_identity_pub");
+            error!(target: "Client/PhonePair", "Missing primary_identity_pub element");
             return;
         }
     };
 
+    // Generate random bytes for adv secret computation
     let mut adv_secret_random = [0u8; 32];
-    use rand::RngCore;
-    rand::rng().fill_bytes(&mut adv_secret_random);
+    use rand::{rng, RngCore};
+    rng().fill_bytes(&mut adv_secret_random);
 
+    // Decrypt the primary device's ephemeral public key
     let primary_decrypted_pubkey = match decrypt_primary_ephemeral_key(
         &link_cache.linking_code,
         wrapped_primary_ephemeral_pub,
@@ -196,6 +192,7 @@ async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: 
         }
     };
 
+    // Compute the ephemeral shared secret using our ephemeral private key and the decrypted primary ephemeral public key
     let ephemeral_shared_secret = match link_cache.key_pair.private_key.calculate_agreement(
         &match wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&primary_decrypted_pubkey) {
             Ok(pk) => pk,
@@ -212,25 +209,25 @@ async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: 
         }
     };
 
+    // Get our identity key for the key bundle
     let device_snapshot = client.persistence_manager.get_device_snapshot().await;
     let identity_key_bytes = device_snapshot.identity_key.public_key.public_key_bytes();
 
+    // Encrypt and wrap the key bundle containing our identity key, primary identity key, and randomness
     let wrapped_key_bundle = match encrypt_key_bundle(
         &ephemeral_shared_secret,
         identity_key_bytes,
         primary_identity_pub,
         &adv_secret_random,
     ) {
-        Ok(bundle) => {
-            info!(target: "Client/PhonePair", "Successfully encrypted key bundle, size: {} bytes", bundle.len());
-            bundle
-        },
+        Ok(bundle) => bundle,
         Err(e) => {
             error!(target: "Client/PhonePair", "Failed to encrypt key bundle: {e}");
             return;
         }
     };
 
+    // Compute the identity shared secret for adv secret computation
     let primary_identity_pubkey = match wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(primary_identity_pub) {
         Ok(pk) => pk,
         Err(e) => {
@@ -247,6 +244,7 @@ async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: 
         }
     };
 
+    // Compute the adv secret (used to authenticate pair-success event later)
     let adv_secret = match compute_adv_secret(
         &ephemeral_shared_secret,
         &identity_shared_key,
@@ -259,11 +257,13 @@ async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: 
         }
     };
 
+    // Store the adv secret key for later use in pair-success authentication
     client
         .persistence_manager
         .process_command(crate::store::commands::DeviceCommand::SetAdvSecretKey(adv_secret))
         .await;
 
+    // Build and send the companion_finish response
     let finish_node = NodeBuilder::new("link_code_companion_reg")
         .attrs([
             ("jid", link_cache.jid.to_string()),
@@ -277,7 +277,7 @@ async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: 
                 .bytes(identity_key_bytes.to_vec())
                 .build(),
             NodeBuilder::new("link_code_pairing_ref")
-                .bytes(pairing_ref_bytes.clone())
+                .bytes(link_code_pairing_ref.clone())
                 .build(),
         ])
         .build();
@@ -289,9 +289,17 @@ async fn handle_code_pair_notification(client: &Arc<Client>, notification_node: 
         target: None,
         id: None,
         content: Some(wacore_binary::node::NodeContent::Nodes(vec![finish_node])),
-        timeout: None,
+        timeout: Some(std::time::Duration::from_secs(10)),
     };
 
     info!(target: "Client/PhonePair", "Sending companion_finish IQ, waiting for response...");
-    client.send_iq(iq).await.expect("Failed to send companion_finish IQ");
+    match client.send_iq(iq).await {
+        Ok(response) => {
+            info!(target: "Client/PhonePair", "Phone pairing companion_finish completed successfully");
+            // info!(target: "Client/PhonePair", "Response: {}", response);
+        }
+        Err(e) => {
+            error!(target: "Client/PhonePair", "Failed to complete companion_finish: {e}");
+        }
+    }
 }
