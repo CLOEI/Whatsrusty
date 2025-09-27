@@ -1,4 +1,5 @@
 pub use wacore::{proto_helpers, store::traits, PairClientType};
+pub use waproto as wa_proto;
 
 pub mod types;
 
