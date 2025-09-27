@@ -8,3 +8,6 @@ pub mod whatsapp {
     #[rustfmt::skip]
     include!("whatsapp.rs");
 }
+
+// Re-export commonly used types at the crate root
+pub use whatsapp::*;
