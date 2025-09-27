@@ -289,17 +289,18 @@ async fn handle_code_pair_notification(client: &Arc<Client>, parent_node: &Node)
         target: None,
         id: None,
         content: Some(wacore_binary::node::NodeContent::Nodes(vec![finish_node])),
-        timeout: Some(std::time::Duration::from_secs(10)),
+        timeout: None,
     };
 
-    info!(target: "Client/PhonePair", "Sending companion_finish IQ, waiting for response...");
-    match client.send_iq(iq).await {
-        Ok(response) => {
-            info!(target: "Client/PhonePair", "Phone pairing companion_finish completed successfully");
-            // info!(target: "Client/PhonePair", "Response: {}", response);
+    let client_clone = client.clone();
+    tokio::spawn(async move {
+        match client_clone.send_iq(iq).await {
+            Ok(_response) => {
+                info!(target: "Client/PhonePair", "Phone pairing companion_finish completed successfully");
+            }
+            Err(e) => {
+                error!(target: "Client/PhonePair", "Failed to complete companion_finish: {e}");
+            }
         }
-        Err(e) => {
-            error!(target: "Client/PhonePair", "Failed to complete companion_finish: {e}");
-        }
-    }
+    });
 }
